@@ -1,110 +1,199 @@
-#!/bin/bash
-# usage: bin/compile <build-dir> <cache-dir> <env-dir>
+#!/usr/bin/env bash
+# usage: bin/compile <build_dir> <cache_dir> <env_dir>
 
-set -eo pipefail
+set -o errexit
+set -o pipefail
 
-BUILD_DIR=${1:-}
-CACHE_DIR=${2:-}
-ENV_DIR=${3:-}
-buildpack="$(cd -P "$(dirname "$0")" && pwd)"
-
-source "${buildpack}/common.sh"
-
-if [ -n "$BUILDPACK_DEBUG" ]; then
-  set -x
+if [ -n "${BUILDPACK_DEBUG}" ]; then
+    set -o xtrace
 fi
 
-MATTERMOST_PATH="$BUILD_DIR/mattermost"
-TMP_PATH="$BUILD_DIR/tmp"
-mkdir -p "${BUILD_DIR}/bin" "${CACHE_DIR}/dist" "${CACHE_DIR}/dist/plugins" "${TMP_PATH}"
-export PATH="$BUILD_DIR/bin:$PATH"
+readonly BUILD_DIR="${1:-}"
+readonly CACHE_DIR="${2:-}"
+readonly ENV_DIR="${3:-}"
 
-STACK="${STACK:-scalingo-18}"
+readonly BASE_DIR="$( cd -P "$( dirname "${0}" )" && pwd )"
+readonly BUILDPACK_DIR="$( readlink -f "${BASE_DIR}/.." )"
 
-start "Install Mattermost"
 
-if [[ -f "$ENV_DIR/MATTERMOST_VERSION" ]]; then
-  MATTERMOST_VERSION=$(cat "$ENV_DIR/MATTERMOST_VERSION")
-else
-  MATTERMOST_VERSION="5.34.2"
+source "${BUILDPACK_DIR}/bin/fn.sh"
+
+
+# # #
+
+
+function fetch_github_latest_release() {
+    readonly repo="${1}"
+
+    local http_code
+    local url
+
+    http_code="$( curl \
+                  --get \
+                  --header "Accept: application/vnd.github.v3+json" \
+                  --output "/tmp/latest_release.json" \
+                  --write-out "%{http_code}" \
+                  "https://api.github.com/repos/${repo}/releases/latest" )"
+
+    if [ "${http_code}" == "200" ]; then
+        url=$(cat "$TMP_PATH/latest_release.json" | jq 'if (.assets | length < 2) then .assets[0].browser_download_url else .assets[] | select(.name|test("linux_amd64";"ix")) | .browser_download_url end' | xargs)
+        url="${plugin_url%\"}"
+        url="${plugin_url#\"}"
+    fi
+
+    echo "${url}"
+}
+
+function install_github_plugins_list() {
+  local location="$1"
+  local plugins_list="$2"
+  info "Plugins list to install: ${plugins_list}"
+  local plugin_url
+  for plugin_id in $(echo "$plugins_list" | tr ',' '\n')
+  do
+    plugin_url=$(fetch_github_latest_release "$plugin_id")
+    info "Plugin id to install: ${plugin_id}"
+    if [[ -n $plugin_url ]]; then
+      install_plugin "$location" "$plugin_url"
+    else
+      warn "No plugin with id $plugin_id found in Github"
+    fi
+  done
+}
+
+
+# # #
+
+
+# Currently, it doesn't seem possible to install somewhere else.
+readonly mm_dir="${BUILD_DIR}"
+
+mkdir -p "${mm_dir}" "${BUILD_DIR}/bin" "${CACHE_DIR}/dist/plugins"
+
+PATH="${BUILD_DIR}/bin":"${mm_dir}/bin":"${PATH}"
+export PATH
+
+
+start "Installing Mattermost"
+
+# Version
+mm_version="${MATTERMOST_VERSION:-latest}"
+
+if [ "${mm_version}" == "latest" ]; then
+    mm_version="$( retrieve_github_latest_release "mattermost" "mattermost" )"
+    # Mattermost versioning starts with the letter 'v', we have to remove it:
+    mm_version="${mm_version:1}"
 fi
 
-if [[ -f "${ENV_DIR}/MATTERMOST_EDITION" ]]; then
-  MATTERMOST_EDITION=$(cat "$ENV_DIR/MATTERMOST_EDITION")
-else
-  MATTERMOST_EDITION="" # default is enterprise (empty) and otherwise team
+if [ -z "${mm_version}" ]; then
+    err "Could not retrieve Mattermost version."
+    info "You can specify the version by using the MATTERMOST_VERSION environment variable."
+    failure
 fi
 
-start "Fetch Mattermost ${MATTERMOST_VERSION} ${MATTERMOST_EDITION} dist"
+# Edition
+mm_edition="${MATTERMOST_EDITION:-}"
 
-if [ ! -d "${MATTERMOST_PATH}" ]; then
-  fetch_mattermost_dist "${MATTERMOST_VERSION}" "${TMP_PATH}" "${MATTERMOST_EDITION}" | indent
-  mv "${TMP_PATH}/mattermost" "${MATTERMOST_PATH}"
-else
-  warn "Mattermost already installed"
-  if [[ -f "${ENV_DIR}/MATTERMOST_MIGRATION" ]]; then
-    MATTERMOST_MIGRATION=$(cat "$ENV_DIR/MATTERMOST_MIGRATION")
-  else
-    MATTERMOST_MIGRATION=0
-  fi
-  if [ $MATTERMOST_MIGRATION == 1 ]; then
-    info "Mattermost migration into ${MATTERMOST_VERSION}"
-    mv "/app/mattermost" "${TMP_PATH}/mattermost-backup"
-    fetch_mattermost_dist "${MATTERMOST_VERSION}" "${TMP_PATH}" | indent
-    mv "${TMP_PATH}/mattermost-${MATTERMOST_VERSION}" "${MATTERMOST_PATH}"
-  fi
-fi
-finished
+info "Using Mattermost ${mm_edition:-"enterprise"} edition version ${mm_version}."
 
-start "Install plugins list from marketplace"
-if [[ ! -d "$MATTERMOST_PATH/postdeploy_plugins" ]]; then
-  mkdir -p "$MATTERMOST_PATH/postdeploy_plugins"
-fi
-if [[ -f "${ENV_DIR}/MATTERMOST_MARKETPLACE_PLUGINS" ]]; then
-  MATTERMOST_MARKETPLACE_PLUGINS=$(cat "$ENV_DIR/MATTERMOST_MARKETPLACE_PLUGINS")
-else
-  MATTERMOST_MARKETPLACE_PLUGINS=""
-fi
-if [[ -n $MATTERMOST_MARKETPLACE_PLUGINS ]]; then  
-  install_marketplace_plugins_list "$BUILD_DIR/mattermost/postdeploy_plugins" "${MATTERMOST_VERSION}" "${MATTERMOST_MARKETPLACE_PLUGINS}"
-else
-  info "No plugins from marketplace to install"
-fi
-finished
+# Mattermost distribution
+dist="mattermost"
 
-start "Install plugins list from Github"
-if [[ -f "${ENV_DIR}/MATTERMOST_GITHUB_PLUGINS" ]]; then
-  MATTERMOST_GITHUB_PLUGINS=$(cat "$ENV_DIR/MATTERMOST_GITHUB_PLUGINS")
-else
-  MATTERMOST_GITHUB_PLUGINS=""
-fi
-if [[ -n $MATTERMOST_GITHUB_PLUGINS ]]; then  
-  install_github_plugins_list "$BUILD_DIR/mattermost/postdeploy_plugins" "${MATTERMOST_GITHUB_PLUGINS}"
-else
-  info "No plugins from Github to install"
-fi
-finished
-
-if [[ -z "${MATTERMOST_EDITION}" ]]; then
-  MATTERMOST_EDITION_LABEL="enterprise"
-else
-  MATTERMOST_EDITION_LABEL="team" # default is enterprise (empty) and otherwise team
+if [ -n "${mm_edition}" ]; then
+    dist="${dist}-${mm_edition}"
 fi
 
-info "Using mattermost version: ${MATTERMOST_VERSION} edition: ${MATTERMOST_EDITION_LABEL}" | indent
-finished
+dist="${dist}-${mm_version}-linux-amd64.tar.gz"
 
-start "Building run"
-cp "${buildpack}/run.sh" "${MATTERMOST_PATH}/bin/run"
-chmod +x "${MATTERMOST_PATH}/bin/run"
-finished
 
-start "Building postdeploy"
-cp "${buildpack}/postdeploy.sh" "${MATTERMOST_PATH}/bin/postdeploy"
-chmod +x "${MATTERMOST_PATH}/bin/postdeploy"
-finished
+# # #
 
-step "Cleaning up tmp files"
-rm -rf "${TMP_PATH}"
 
-finished
+readonly cache_file="${CACHE_DIR}/${dist}"
+
+readonly package_url="https://releases.mattermost.com/${mm_version}/${dist}"
+readonly checksum_url="${package_url}.sha256"
+
+if [ -f "${cache_file}" ]
+then
+    info "Found file in cache."
+    do_start "Checking validity" \
+        && check_cached_file "${cache_file}" "${checksum_url}" \
+        && do_finish \
+        || ( do_fail \
+            && err "File in cache is invalid, it has been removed." )
+fi
+
+if [ ! -f "${cache_file}" ]
+then
+    do_start "Downloading" \
+        && download "${package_url}" "${checksum_url}" "${cache_file}" \
+        && do_finish \
+        || ( do_fail \
+            && err "An error occured while downloading. Aborting." \
+            && failure )
+fi
+
+do_start "Extracting" \
+    && tar --extract --file="${cache_file}" --directory="${CACHE_DIR}" \
+        2>/dev/null \
+    && do_finish \
+    || ( do_fail \
+        && err "An error occured while extracting the archive. Aborting." \
+        && failure )
+
+do_start "Installing" \
+    && mv "${CACHE_DIR}/mattermost"/* "${mm_dir}/" \
+        2>/dev/null \
+    && do_finish \
+    || ( do_fail \
+        && err "An error occured while installing the files. Aborting." \
+        && failure )
+
+success
+
+
+if [ -n "${MATTERMOST_GITHUB_PLUGINS}" ]; then
+    start "Installing GitHub plugins"
+
+    # Loop through a comma separated string:
+    for plugin in ${MATTERMOST_GITHUB_PLUGINS//,/ }
+    do
+        do_start "Installing ${plugin}"
+
+        org="$( cut -d "/" -f 1 <<< "${plugin}" )"
+        repo="$( cut -d "/" -f 2 <<< "${plugin}" )"
+
+        info="$( helper::github::retrieve_latest_release_info \
+                 "${org}" "${repo}" )"
+
+        version="$( helper::github::retrieve_latest_release_version \
+                    "${info}" )"
+
+        echo "${plugin} ${version}" \
+            && do_finish
+    done
+
+    success
+fi
+
+start "Deploying run script"
+
+do_start "Copying script" \
+    && cp "${BUILDPACK_DIR}/bin/run.sh" "${mm_dir}/bin/run" \
+    && chmod +x "${mm_dir}/bin/run" \
+    && do_finish \
+    || ( do_fail && failure )
+
+success
+
+
+start "Deploying postdeploy script"
+
+do_start "Copying script" \
+    && cp "${BUILDPACK_DIR}/bin/postdeploy.sh" "${mm_dir}/bin/postdeploy" \
+    && chmod +x "${mm_dir}/bin/postdeploy" \
+    && do_finish \
+    || ( do_fail && failure )
+
+success

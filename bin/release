@@ -5,8 +5,9 @@ cat << EOF
 addons:
  - scalingo-postgresql
 config_vars:
-  PATH: "/app/bin:/app/mattermost/bin:/usr/local/bin:/usr/bin:/bin"
+  PATH: "/app/bin:/usr/local/bin:/usr/bin:/bin"
+  MM_SERVICESETTINGS_LISTENADDRESS: ":${PORT}"
 default_process_types:
-  web: /app/mattermost/bin/run
-  postdeploy: /app/mattermost/bin/postdeploy
+  web: /app/bin/run
+  postdeploy: /app/bin/postdeploy
 EOF

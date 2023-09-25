@@ -1,6 +1,5 @@
-#!/bin/bash
-# usage: /app/mattermost/bin/run
+#!/usr/bin/env bash
 
 export MM_SERVICESETTINGS_LISTENADDRESS=":${PORT}"
 
-/app/mattermost/bin/mattermost
+/app/bin/mattermost
